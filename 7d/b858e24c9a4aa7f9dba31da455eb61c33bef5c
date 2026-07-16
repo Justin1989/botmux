@@ -1,0 +1,27 @@
+src/adapters/backend/tmux-backend.ts
+  s_daec6ff5836f33::t_672a86367765e3 12-25,31-35,37-40
+src/core/session-manager.ts
+  s_daec6ff5836f33::t_fb16475ac450c4 1072
+test/session-resume.test.ts
+  s_daec6ff5836f33::t_e139e9ee752dbd 335-350
+test/tmux-backend-env.test.ts
+  s_daec6ff5836f33::t_52ac6f5212b777 556-590
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7db858e24c9a4aa7f9dba31da455eb61c33bef5c",
+  "prompts": {},
+  "sessions": {
+    "s_daec6ff5836f33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0dc52a32-db8d-4819-9cd7-6e6da5a36d96",
+        "model": "unknown"
+      },
+      "human_author": "zhangwei.justin <zhangwei.justin@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

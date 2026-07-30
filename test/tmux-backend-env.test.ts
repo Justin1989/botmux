@@ -119,6 +119,20 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards SessionStart transport diagnostics and the daemon IPC port', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_DAEMON_IPC_PORT: '7950',
+      BOTMUX_SESSION_READY_TRACE: '1',
+      BOTMUX_SESSION_READY_TRACE_DIR: '/data/session-ready-traces/trace-key',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_DAEMON_IPC_PORT=7950');
+    expect(out).toContain('BOTMUX_SESSION_READY_TRACE=1');
+    expect(out).toContain('BOTMUX_SESSION_READY_TRACE_DIR=/data/session-ready-traces/trace-key');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('forwards the worker-owned MCP relay capability into the CLI pane', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

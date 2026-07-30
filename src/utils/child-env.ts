@@ -66,6 +66,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
   // A port marker, not a credential — every route authenticates independently.
   'BOTMUX_DAEMON_IPC_PORT',
+  // Opt-in, sanitized SessionStart transport diagnostics. These must reach the
+  // hook process even when a tmux pane is started from a shared server env.
+  'BOTMUX_SESSION_READY_TRACE',
+  'BOTMUX_SESSION_READY_TRACE_DIR',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',

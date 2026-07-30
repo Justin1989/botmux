@@ -5,6 +5,8 @@ const EXTERNAL_HOST_KEYS = [
   'BOTMUX_DASHBOARD_EXTERNAL_HOST',
 ] as const;
 
+const SESSION_READY_TRACE_KEY = 'BOTMUX_SESSION_READY_TRACE';
+
 /**
  * Pin both PM2 apps to one deterministic external-host snapshot. A lifecycle
  * command launched inside a botmux session inherited its values from the old
@@ -27,4 +29,13 @@ export function resolveDaemonExternalHostEnv(
     WEB_EXTERNAL_HOST: resolve('WEB_EXTERNAL_HOST'),
     BOTMUX_DASHBOARD_EXTERNAL_HOST: resolve('BOTMUX_DASHBOARD_EXTERNAL_HOST'),
   };
+}
+
+export function resolveSessionReadyTraceDaemonEnv(
+  inheritedEnv: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const value = inheritedEnv[SESSION_READY_TRACE_KEY];
+  return typeof value === 'string'
+    ? { [SESSION_READY_TRACE_KEY]: value }
+    : {};
 }

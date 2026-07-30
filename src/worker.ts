@@ -201,6 +201,7 @@ import {
 } from './adapters/hook-installer.js';
 import { hookCommandFor } from './adapters/hook-command.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
+import { writeSessionReadyTrace } from './core/session-ready-trace.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
@@ -914,6 +915,10 @@ function settleThenFlush(startedAtMs: number, promptReadyAfterSettle: boolean): 
 function releaseReadyGate(reason: string, opts?: { promptReadyAfterSettle?: boolean }): void {
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyGate.receive()) {
+    writeSessionReadyTrace(process.env.SESSION_DATA_DIR, sessionId, 'worker_gate_released', {
+      reason: reason === 'SessionStart hook' ? 'session_start' : 'timeout',
+      promptReadyAfterSettle: opts?.promptReadyAfterSettle === true,
+    });
     log(`Ready gate released (${reason}); settling for PTY quiescence before first flush`);
     if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
     isSettlingFirstFlush = true;
@@ -6981,6 +6986,15 @@ async function spawnCli(
     willReattachPersistent,
   })) {
     readyGate.arm();
+    writeSessionReadyTrace(process.env.SESSION_DATA_DIR, cfg.sessionId, 'worker_gate_armed', {
+      cliId: cfg.cliId,
+      backend: effectiveBackendType,
+      sandbox: sandboxOn,
+      readIsolation: willReadIsolate,
+      hasPort: parseDaemonIpcPort(childEnv.BOTMUX_DAEMON_IPC_PORT) !== undefined,
+      hasCapability: readyCapabilityAvailable,
+      hasWrapper: !!cfg.wrapperCli,
+    });
     log('Ready gate armed — holding first prompt until SessionStart ready signal');
     readySignalTimer = setTimeout(() => {
       readySignalTimer = null;
@@ -9000,6 +9014,11 @@ process.on('message', async (raw: unknown) => {
       // ready-gate and deliver any held first prompt. Idempotent: a later
       // duplicate (clear/compact source) is a no-op.
       log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
+      writeSessionReadyTrace(process.env.SESSION_DATA_DIR, sessionId, 'worker_signal_received', {
+        hasSource: !!msg.source,
+        gateArmed: readyGate.isArmed,
+        gateReceived: readyGate.isReceived,
+      });
       // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
       // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
       const lateAfterFallback = readyGate.isArmed && readyGate.isReceived;

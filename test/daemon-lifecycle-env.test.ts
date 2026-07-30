@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { resolveDaemonExternalHostEnv } from '../src/cli/daemon-lifecycle-env.js';
+import {
+  resolveDaemonExternalHostEnv,
+  resolveSessionReadyTraceDaemonEnv,
+} from '../src/cli/daemon-lifecycle-env.js';
 
 describe('resolveDaemonExternalHostEnv()', () => {
   it('clears inherited host settings when restart comes from a botmux session', () => {
@@ -49,5 +52,15 @@ describe('resolveDaemonExternalHostEnv()', () => {
       WEB_EXTERNAL_HOST: '',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: '',
     });
+  });
+
+  it('forwards the opt-in session-ready trace flag into daemon startup', () => {
+    expect(resolveSessionReadyTraceDaemonEnv({
+      BOTMUX_SESSION_READY_TRACE: '1',
+    })).toEqual({ BOTMUX_SESSION_READY_TRACE: '1' });
+    expect(resolveSessionReadyTraceDaemonEnv({
+      BOTMUX_SESSION_READY_TRACE: '0',
+    })).toEqual({ BOTMUX_SESSION_READY_TRACE: '0' });
+    expect(resolveSessionReadyTraceDaemonEnv({})).toEqual({});
   });
 });

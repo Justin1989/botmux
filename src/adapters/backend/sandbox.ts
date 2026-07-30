@@ -33,6 +33,7 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import { sessionReadyTraceDirectory } from '../../core/session-ready-trace.js';
 
 /** Host root for the HOME overlay's upper/work — MUST be OUTSIDE the home lower
  *  (overlayfs forbids upper/work inside lower). */
@@ -153,6 +154,8 @@ export interface SandboxPlan {
   homeMerged: string;
   /** Daemon-mediated `botmux send` outbox — bound LAST so it wins over any mask. */
   outbox: string;
+  /** Opt-in SessionStart trace directory, writable only for this session. */
+  traceDir?: string;
   /** Trusted worker-side MCP socket directory. The sandbox sees only this
    * session's socket at a fixed path under its private /run tmpfs. */
   mcpGatewaySocket?: { hostDir: string; sandboxDir: string };
@@ -242,8 +245,9 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   // re-expose them.
   for (const dir of plan.postReadonlyHideDirs ?? []) a.push('--tmpfs', dir);
   for (const f of plan.postReadonlyHideFiles ?? []) a.push('--ro-bind', f.empty, f.path);
-  // Outbox LAST so it wins even if a mask covers a parent dir.
+  // Outbox and trace bind LAST so they win even if a mask covers a parent dir.
   a.push('--bind', plan.outbox, plan.outbox);
+  if (plan.traceDir) a.push('--bind', plan.traceDir, plan.traceDir);
   // Isolate namespaces (keep net unless explicitly disabled).
   a.push('--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try');
   if (plan.net === false) a.push('--unshare-net');
@@ -609,6 +613,9 @@ export function prepareSandbox(opts: {
   const overlayPaths = sandboxOverlayPaths(dataDir, opts.sessionId);
   const sessionRoot = overlayPaths.sessionRoot;
   const outbox = join(sessionRoot, 'outbox');
+  const traceDir = process.env.BOTMUX_SESSION_READY_TRACE === '1'
+    ? sessionReadyTraceDirectory(dataDir, opts.sessionId)
+    : undefined;
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
   const landingProjUpper = join(sessionRoot, 'proj-upper'); // stable /land path
@@ -619,7 +626,9 @@ export function prepareSandbox(opts: {
   const vartmp = overlayPaths.runtimeRoot;
   const homeUpper = join(vartmp, 'home-upper');
   const homeWork = join(vartmp, 'home-work');
-  for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
+  for (const d of [outbox, traceDir, shimBin, empties]) {
+    if (d) mkdirSync(d, { recursive: true });
+  }
 
   const home = resolveSandboxMountPath(homedir());
   // Masking BOTMUX_HOME is mandatory for the credential boundary.  A layout
@@ -819,6 +828,7 @@ export function prepareSandbox(opts: {
     home,
     homeMerged,
     outbox,
+    traceDir,
     mcpGatewaySocket,
     hideDirs,
     hideFiles,
@@ -887,6 +897,10 @@ export function prepareSandbox(opts: {
   // Not a credential: every route it reaches authenticates independently.
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
+  }
+  if (traceDir) {
+    env.BOTMUX_SESSION_READY_TRACE = '1';
+    env.BOTMUX_SESSION_READY_TRACE_DIR = traceDir;
   }
   if (sandboxMcpGatewaySocketPath) {
     env[MCP_GATEWAY_SOCKET_ENV] = sandboxMcpGatewaySocketPath;

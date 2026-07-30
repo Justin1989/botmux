@@ -92,14 +92,16 @@ describe('buildSandboxArgs (overlay model)', () => {
     expect(bindDest(a, '--ro-bind', '/data/sandboxes/s1/empties/mask-0')).toBe('/root/.botmux/bots.json');
   });
 
-  it('binds the outbox LAST so a mask covering a parent dir cannot shadow it', () => {
+  it('binds the outbox and optional trace directory after masks', () => {
     const a = buildSandboxArgs(plan({
-      hideDirs: ['/data/sandboxes/s1'],  // covers the outbox's parent
+      hideDirs: ['/data/sandboxes/s1'],
+      traceDir: '/data/session-ready-traces/trace-key',
     }));
     const maskIdx = a.indexOf('/data/sandboxes/s1');
     const outboxIdx = tripleIdx(a, '--bind', '/data/sandboxes/s1/outbox', '/data/sandboxes/s1/outbox');
-    expect(outboxIdx).toBeGreaterThanOrEqual(0);
-    expect(outboxIdx).toBeGreaterThan(maskIdx); // outbox bind comes after the mask
+    const traceIdx = tripleIdx(a, '--bind', '/data/session-ready-traces/trace-key', '/data/session-ready-traces/trace-key');
+    expect(outboxIdx).toBeGreaterThan(maskIdx);
+    expect(traceIdx).toBeGreaterThan(outboxIdx);
   });
 
   it('binds selected skill runtime roots read-only before the outbox', () => {

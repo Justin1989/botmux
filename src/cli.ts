@@ -80,7 +80,10 @@ import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
-import { resolveDaemonExternalHostEnv } from './cli/daemon-lifecycle-env.js';
+import {
+  resolveDaemonExternalHostEnv,
+  resolveSessionReadyTraceDaemonEnv,
+} from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
@@ -150,7 +153,8 @@ import {
   enabledPluginDependents,
 } from './core/plugins/dependencies.js';
 import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
-import { resolveDaemonIpcPort } from './utils/daemon-discovery.js';
+import { parseDaemonIpcPort, resolveDaemonIpcPort } from './utils/daemon-discovery.js';
+import { sessionReadyErrorKind, writeSessionReadyTrace } from './core/session-ready-trace.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -389,6 +393,7 @@ function ecosystemConfig(): string {
     process.env,
     existsSync(ENV_FILE) ? readFileSync(ENV_FILE, 'utf-8') : undefined,
   );
+  const sessionReadyTraceEnv = resolveSessionReadyTraceDaemonEnv(process.env);
 
   const baseApp = {
     script: daemonScript,
@@ -427,6 +432,7 @@ function ecosystemConfig(): string {
     out_file: join(LOG_DIR, `daemon-${i}-out.log`),
     env: {
       ...externalHostEnv,
+      ...sessionReadyTraceEnv,
       SESSION_DATA_DIR: DATA_DIR,
       BOTMUX_BOT_INDEX: String(i),
       // Native-memory diagnostics. Default off; operator can flip it on
@@ -7778,8 +7784,26 @@ async function cmdSessionReady(): Promise<void> {
 
   const sessionId = process.env.BOTMUX_SESSION_ID;
   const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  let dataDir: string | undefined;
+  try { dataDir = resolveDataDir(); } catch { /* diagnostics must remain fail-open */ }
+  const injectedPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  writeSessionReadyTrace(dataDir, sessionId, 'hook_start', {
+    hasSessionId: !!sessionId,
+    hasSource: !!source,
+    hasAppId: !!larkAppId,
+    hasInjectedPort: injectedPort !== undefined,
+    hasRelay: !!relayDir,
+  });
   // env 缺失 → adopt / 非 botmux 会话；就绪门控对它们不适用，静默放行。
-  if (!sessionId || !larkAppId) process.exit(0);
+  if (!sessionId || !larkAppId) {
+    writeSessionReadyTrace(dataDir, sessionId, 'hook_skip_missing_context', {
+      hasSessionId: !!sessionId,
+      hasAppId: !!larkAppId,
+    });
+    process.exit(0);
+  }
+  if (!dataDir) process.exit(0);
 
   // Host sessions discover the owning daemon through its descriptor. Linux
   // bwrap / read-isolated sessions deliberately cannot read that directory,
@@ -7787,45 +7811,60 @@ async function cmdSessionReady(): Promise<void> {
   // credential: /api/session-ready still verifies the rotating per-turn
   // capability carried below.
   let discoveredPort: number | undefined;
-  try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
-  const ipcPort = resolveDaemonIpcPort(
-    discoveredPort,
-    process.env.BOTMUX_DAEMON_IPC_PORT,
-  );
-  if (ipcPort) {
-    try {
-      const relayDir = process.env.BOTMUX_SEND_RELAY;
-      const originCapability = readManagedOriginCapability(
-        resolveDataDir(),
+  let discoveryReadable = true;
+  try {
+    discoveredPort = findDaemon(larkAppId)?.ipcPort;
+  } catch {
+    discoveryReadable = false;
+  }
+  const ipcPort = resolveDaemonIpcPort(discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    writeSessionReadyTrace(dataDir, sessionId, 'hook_skip_missing_port', {
+      discoveryReadable,
+      hasInjectedPort: injectedPort !== undefined,
+    });
+    process.exit(0);
+  }
+  writeSessionReadyTrace(dataDir, sessionId, 'hook_port_resolved', {
+    discoveryReadable,
+    portSource: discoveredPort !== undefined ? 'discovery' : 'injected',
+  });
+  try {
+    const originCapability = readManagedOriginCapability(dataDir, sessionId, relayDir)?.capability;
+    const liveOrigin = resolveSessionContext(dataDir, sessionId);
+    const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
+    const originTurnId = liveOrigin?.turnId ?? process.env.BOTMUX_TURN_ID;
+    const originDispatchAttempt = liveOrigin?.dispatchAttempt
+      ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined);
+    const init = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
         sessionId,
-        relayDir,
-      )?.capability;
-      const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);
-      const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
-      const originTurnId = liveOrigin?.turnId ?? process.env.BOTMUX_TURN_ID;
-      const originDispatchAttempt = liveOrigin?.dispatchAttempt
-        ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined);
-      const init = {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          source,
-          originCapability,
-          originTurnId,
-          originDispatchAttempt,
-        }),
-      } satisfies RequestInit;
-      let hostSecret: string | undefined;
-      if (!relayDir) {
-        try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
-      }
-      if (!hostSecret) {
-        await fetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
-      } else {
-        await fetchDaemonIpc(ipcPort, '/api/session-ready', init, hostSecret);
-      }
-    } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
+        source,
+        originCapability,
+        originTurnId,
+        originDispatchAttempt,
+      }),
+    } satisfies RequestInit;
+    let hostSecret: string | undefined;
+    if (!relayDir) {
+      try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
+    }
+    const response = hostSecret
+      ? await fetchDaemonIpc(ipcPort, '/api/session-ready', init, hostSecret)
+      : await fetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
+    writeSessionReadyTrace(dataDir, sessionId, 'hook_http_result', {
+      status: response.status,
+      transport: hostSecret ? 'host_hmac' : 'capability',
+      hasCapability: !!originCapability,
+      hasTurnId: !!originTurnId,
+      hasDispatchAttempt: originDispatchAttempt !== undefined,
+    });
+  } catch (error) {
+    writeSessionReadyTrace(dataDir, sessionId, 'hook_http_error', {
+      error: sessionReadyErrorKind(error),
+    });
   }
   process.exit(0);
 }

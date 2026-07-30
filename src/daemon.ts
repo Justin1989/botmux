@@ -111,6 +111,7 @@ import {
   authorizeSessionScopedIpc,
   bindSessionScopedIpcIdentity,
 } from './core/daemon-ipc-session-auth.js';
+import { sessionReadyErrorKind, writeSessionReadyTrace } from './core/session-ready-trace.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -4166,7 +4167,8 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   for (const s of activeSessions.values()) {
     if (s.session.sessionId === sessionId) { ds = s; break; }
   }
-  if (!isTrustedHostIpcRequest(req)) {
+  const trustedHost = isTrustedHostIpcRequest(req);
+  if (!trustedHost) {
     const claimedAttempt = typeof raw.originDispatchAttempt === 'number'
       && Number.isSafeInteger(raw.originDispatchAttempt)
       && raw.originDispatchAttempt > 0
@@ -4186,6 +4188,14 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
       claimedDispatchAttempt: claimedAttempt,
     });
     if (!verified.ok) {
+      if (ds) {
+        writeSessionReadyTrace(config.session.dataDir, sessionId, 'daemon_rejected', {
+          reason: verified.error,
+          hasCapability: typeof raw.originCapability === 'string',
+          hasTurnId: typeof raw.originTurnId === 'string',
+          hasDispatchAttempt: claimedAttempt !== undefined,
+        });
+      }
       return jsonRes(res, 403, {
         ok: false,
         error: verified.error,
@@ -4195,10 +4205,22 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   if (ds?.worker) {
     try {
       ds.worker.send({ type: 'session_ready', source } as DaemonToWorker);
+      writeSessionReadyTrace(config.session.dataDir, sessionId, 'daemon_forwarded', {
+        hasSource: !!source,
+        transport: trustedHost ? 'host_hmac' : 'capability',
+      });
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
+      writeSessionReadyTrace(config.session.dataDir, sessionId, 'daemon_forward_error', {
+        error: sessionReadyErrorKind(err),
+      });
       logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  } else if (ds) {
+    writeSessionReadyTrace(config.session.dataDir, sessionId, 'daemon_no_worker', {
+      sessionExists: true,
+      transport: trustedHost ? 'host_hmac' : 'capability',
+    });
   }
   return jsonRes(res, 200, { ok: true });
 });

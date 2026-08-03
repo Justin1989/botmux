@@ -153,7 +153,7 @@ interface TokenUsageAggregate {
 
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
  *  defines as billable turns — no cross-CLI guessing on usage-shaped lines. */
-type UsageKind = 'claude' | 'codex' | 'coco' | 'generic';
+type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'generic';
 
 function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
   switch (cliId) {
@@ -171,6 +171,8 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
       return 'codex';
     case 'coco':
       return 'coco';
+    case 'pi':
+      return 'pi';
     default:
       return 'generic';
   }
@@ -231,6 +233,24 @@ function foldCocoLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+  if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') return;
+  const msg = entry.message;
+  const u = msg.usage;
+  if (!u || typeof u !== 'object') return;
+  const messageId = typeof msg.id === 'string' ? msg.id : '';
+  if (messageId) {
+    if (seenMessageIds.has(messageId)) return;
+    seenMessageIds.add(messageId);
+  }
+  agg.inputTokens += num(u.input);
+  agg.outputTokens += num(u.output);
+  agg.cacheReadTokens += num(u.cacheRead);
+  agg.cacheCreateTokens += num(u.cacheWrite);
+  if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
+  agg.turns++;
+}
+
 /** Cursor / TraeX / Antigravity: transcripts whose exact dialect is not yet
  *  pinned down — keep the tolerant multi-shape extraction for them. */
 function foldGenericLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
@@ -263,6 +283,8 @@ function foldUsageLine(kind: UsageKind, agg: TokenUsageAggregate, seenMessageIds
       return foldCodexLine(agg, entry);
     case 'coco':
       return foldCocoLine(agg, entry);
+    case 'pi':
+      return foldPiLine(agg, seenMessageIds, entry);
     case 'generic':
       return foldGenericLine(agg, seenMessageIds, entry);
   }

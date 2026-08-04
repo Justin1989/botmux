@@ -10,10 +10,11 @@ import {
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { prepareSandbox } from '../src/adapters/backend/sandbox.js';
+import { prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
+import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { ensureGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
@@ -34,13 +35,20 @@ import {
 
 const builtCli = resolve('dist/cli.js');
 
+// bwrap being installed is not enough: unprivileged user-namespace creation is
+// disabled on many CI runners (GitHub Actions), where bwrap dies with
+// "setting up uid map: Permission denied". Gate on the SAME runtime probe the
+// worker uses so these real-sandbox specs skip (not fail) where the kernel
+// won't let bwrap establish namespaces, while still running on capable hosts.
+const bwrapUsable = probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
+
 function codexForwardedEnvKeys(configPath: string): string[] {
   const match = readFileSync(configPath, 'utf8').match(/^env_vars = (\[[^\n]+])$/m);
   if (!match) throw new Error('generated Codex Gateway entry has no env_vars');
   return JSON.parse(match[1]) as string[];
 }
 
-describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin MCP Gateway sandbox integration', () => {
+describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapUsable)('plugin MCP Gateway sandbox integration', () => {
   let root: string;
   let home: string;
   let dataDir: string;
@@ -117,17 +125,44 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
       const forwardedKeys = codexForwardedEnvKeys(codexConfig);
 
       let gatewayHost: SessionMcpGatewayHost | null = null;
-      let sandbox: ReturnType<typeof prepareSandbox> = null;
+      let sandbox: ReturnType<typeof prepareDirectSandbox> = null;
       let client: Client | null = null;
       let transport: StdioClientTransport | null = null;
       try {
         gatewayHost = await startSessionMcpGatewayHost({ sessionId, dataDir });
-        sandbox = prepareSandbox({
-          enabled: true,
-          cliId: 'codex',
+        const hostOnlyPaths = [
+          sessionMcpRuntimeManifestPath(sessionId, dataDir),
+          sessionMcpRuntimeManifestPath(siblingSessionId, dataDir),
+          pluginMcpPrivatePath(pluginId),
+          join(home, '.botmux', 'plugins', pluginId, 'dist', 'mcp', 'index.json'),
+        ];
+        const botmuxHome = join(dataDir, '..');
+        const botHome = join(botmuxHome, 'bots', 'cli_test');
+        const outbox = join(dataDir, 'sandboxes', sessionId, 'outbox');
+        mkdirSync(botHome, { recursive: true });
+        mkdirSync(outbox, { recursive: true });
+        const policy = buildFsPolicy({
+          platform: 'linux',
+          homeDir: home,
+          botmuxHome,
+          sessionDataDir: dataDir,
+          workingDir: project,
+          currentAppId: 'cli_test',
+          botHome,
+          redirectedCliData: true,
+          execPaths: [dirname(process.execPath)],
+          botmuxInstallRoot: resolve('.'),
+          outbox,
+          mandatoryDenyPaths: hostOnlyPaths,
+        });
+        policy.rules = policy.rules.filter(rule =>
+          rule.access === 'deny' || existsSync(rule.path));
+        sandbox = prepareDirectSandbox({
           sessionId,
-          sourceWorkingDir: project,
           dataDir,
+          policy,
+          chdir: project,
+          home,
           cliBin: gatewayBin,
           cliArgs: ['mcp', 'serve'],
           trustedBotmuxCommandPaths: [gatewayBin],
@@ -135,12 +170,6 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
         });
         if (!sandbox) return; // Required Linux sandbox runtime is unavailable.
 
-        const hostOnlyPaths = [
-          sessionMcpRuntimeManifestPath(sessionId, dataDir),
-          sessionMcpRuntimeManifestPath(siblingSessionId, dataDir),
-          pluginMcpPrivatePath(pluginId),
-          join(home, '.botmux', 'plugins', pluginId, 'dist', 'mcp', 'index.json'),
-        ];
         const commandIndex = sandbox.args.lastIndexOf('--');
         expect(commandIndex).toBeGreaterThanOrEqual(0);
         const probe = spawnSync(
@@ -204,4 +233,52 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
     },
     30_000,
   );
+
+  // Regression: the sandbox PATH must resolve bare `node` even when the host's
+  // lexical $PATH points ONLY at symlink-form dirs that don't exist in the fresh
+  // root (shared drive / ~/.local/bin symlink / fnm / nvm). Before the fix the
+  // trusted `botmux` shim's `exec node` failed `not found` → MCP gateway exited
+  // → Connection closed. The fix prepends dirname(realpath(process.execPath)).
+  it('resolves bare `node` under a hostile symlink-form host PATH (canonical exec dir prepended)', () => {
+    const botmuxHome = join(dataDir, '..');
+    const botHome = join(botmuxHome, 'bots', 'cli_test');
+    const outbox = join(dataDir, 'sandboxes', 'sid-path', 'outbox');
+    mkdirSync(botHome, { recursive: true });
+    mkdirSync(outbox, { recursive: true });
+    const policy = buildFsPolicy({
+      platform: 'linux', homeDir: home, botmuxHome, sessionDataDir: dataDir,
+      workingDir: project, currentAppId: 'cli_test', botHome, redirectedCliData: true,
+      execPaths: [dirname(process.execPath)], botmuxInstallRoot: resolve('.'), outbox,
+    });
+    policy.rules = policy.rules.filter(rule => rule.access === 'deny' || existsSync(rule.path));
+
+    // A PATH that leaves bare `node` unresolvable in the fresh root: a
+    // nonexistent symlink-form dir + the fixed system dirs (which have bwrap but
+    // NOT this test runner's node — its canonical dir is under ~/.local/share).
+    // Keep /usr/bin & /bin so ensureSandboxDeps still finds bwrap on the host.
+    vi.stubEnv('PATH', '/home/nonexistent/.local/bin:/usr/bin:/bin');
+    const sandbox = prepareDirectSandbox({
+      sessionId: 'sid-path', dataDir, policy, chdir: project, home,
+      cliBin: process.execPath, cliArgs: [],
+    });
+    if (!sandbox) return; // sandbox runtime unavailable
+    try {
+      const canonicalNodeDir = dirname(require('node:fs').realpathSync(process.execPath));
+      // PATH prepends the canonical node dir (shim dir stays first)
+      const dirs = sandbox.env.PATH.split(':');
+      expect(dirs[0]).toBe('/run/sbxbin');
+      expect(dirs).toContain(canonicalNodeDir);
+      expect(dirs.indexOf(canonicalNodeDir)).toBeLessThan(dirs.indexOf('/home/nonexistent/.local/bin'));
+      // and bare `node` actually runs inside the real sandbox
+      const commandIndex = sandbox.args.lastIndexOf('--');
+      const probe = spawnSync(sandbox.bin, [
+        ...sandbox.args.slice(0, commandIndex + 1),
+        '/bin/sh', '-c', 'command -v node >/dev/null && node -e "process.exit(0)"',
+      ], { cwd: project, env: { ...process.env, ...sandbox.env }, encoding: 'utf8', timeout: 10_000 });
+      expect(probe.error).toBeUndefined();
+      expect(probe.status, probe.stderr).toBe(0);
+    } finally {
+      sandbox.cleanup();
+    }
+  });
 });

@@ -24,6 +24,7 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 
 export type InflightItem = {
   content: string;
+  logicalContent?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -37,6 +38,15 @@ export class InflightInputTracker {
   /** An input just went onto the CLI's PTY. */
   onWrite(item: InflightItem): void {
     this.unacked.push(item);
+  }
+
+  /** Retire one exact write whose transport outcome is ambiguous and must not
+   * be replayed automatically. Other type-ahead items remain tracked. */
+  retire(item: InflightItem): boolean {
+    const index = this.unacked.indexOf(item);
+    if (index < 0) return false;
+    this.unacked.splice(index, 1);
+    return true;
   }
 
   /** CLI is back at its idle prompt — everything written has been consumed

@@ -39,11 +39,24 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** True after the current worker generation has completed init. Kept
+   * separate from workerPort because backends without a Web Terminal still
+   * emit screen/idle/screenshot updates and support native local attach. */
+  workerReady?: boolean;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy
    * sessions; live workers publish it with their ready event. */
   workerViewToken?: string | null;
+  /** Latest process identity reported over the trusted worker IPC channel.
+   * Used to quiesce legacy unconfined CLIs before device credentials exist. */
+  localProcessAttestation?: {
+    backendType: import('../adapters/backend/types.js').BackendType;
+    credentialIsolated: boolean;
+    cliPid?: number;
+    cliProcStart?: string;
+    workerGeneration?: number;
+  };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
@@ -63,6 +76,12 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
+   *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
+   *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
+   *  其他用户直接读到（绕过 dashboard cookie + loopback-HMAC）。worker 每次 ready
+   *  都会重报，daemon 重启后自愈。仅有写权限的 dashboard 视图经 spawn-command 接口取。 */
+  spawnCommand?: string;
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   /** One in-memory owner is preparing the pending repo's first worker. Kept
    *  separate from worktreeCreating because plain select, skip, and /repo can
@@ -149,6 +168,12 @@ export interface DaemonSession {
    *  Entries outlive turn_terminal briefly to cover trailing worker events and
    *  are pruned by age/size when new silent turns are armed. */
   silentScheduledTurns?: Map<string, number>;
+  /** Turn-exact ids for loud external triggers whose connector opted into
+   *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
+   *  (the streaming card / start notice still show); keyed on the trigger turn
+   *  id so a normal user turn on the same session is unaffected. Bounded +
+   *  age-pruned like silentScheduledTurns. */
+  suppressedTriggerFinalTurns?: Map<string, number>;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet
@@ -174,6 +199,10 @@ export interface DaemonSession {
   riffAccessUrl?: string;
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Interval that re-PATCHes the live streaming card with fresh Context/Token
+   *  usage while a turn is executing (streaming display mode). Armed on the
+   *  working edge, cleared on idle/turn-end/card removal. */
+  usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
   lastCodexAppInput?: CodexAppTurnInput;
@@ -201,6 +230,7 @@ export interface DaemonSession {
     createdAt: number;
     completedAt?: number;
     content?: string;
+    usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
@@ -219,6 +249,37 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** A final ScreenAnalyzer TUI answer has been dispatched and is waiting for
+   * the worker's resolved/failed ACK. Claimed synchronously by card-handler so
+   * duplicate clicks cannot inject a second key sequence into the same CLI. */
+  tuiPromptProcessing?: boolean;
+  /** turnId of the last stuck_warning posted — dedup so we don't spam the
+   *  thread with repeated warnings for the same unresolved turn. */
+  stuckWarningTurnId?: string;
+  /** message_id of the stuck_warning interactive card (if active) */
+  stuckWarningCardId?: string;
+  /** Daemon-side monotonic counter for stuck_warning nonces. NEVER cleared —
+   *  even when the active warning authority is dropped, the counter keeps
+   *  climbing so a late POST result / ACK from a previous warning (nonce=N)
+   *  can never match a newer warning that happened to reuse N after a clear.
+   *  stuckWarningNonce (below) is the active warning's nonce and may clear. */
+  stuckWarningNonceCounter?: number;
+  /** Daemon-side monotonic nonce for the active stuck_warning. Bumped on every
+   *  new warning so a late POST result or stale card click from a previous
+   *  warning (or a previous worker generation) cannot resurrect authority. */
+  stuckWarningNonce?: number;
+  /** Page type of the active stuck-warning card ('hook review level 1' or
+   *  'hook review level 2') — forwarded to the worker on card click so it can
+   *  re-verify the current screen before injecting keys. */
+  stuckWarningPageType?: string;
+  /** When true, a card click has been dispatched to the worker and we are
+   *  waiting for the tui_keys_delivered / stuck_warning_expired ACK. Blocks
+   *  duplicate clicks from injecting keys twice. */
+  stuckWarningProcessing?: boolean;
+  /** Worker's cliLifetimeNonce at the time the stuck_warning was posted.
+   *  Forwarded back to the worker in tui_keys so it can verify the backend
+   *  hasn't been replaced within the same worker process. */
+  stuckWarningCliLifetime?: number;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
@@ -342,7 +403,19 @@ export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | 
  *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
+  const deferredAnchor = ds.session.deferredScheduleRun?.routingAnchor;
+  if (deferredAnchor) return deferredAnchor;
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+/** Resolve a persisted session's daemon routing anchor without first building
+ * a DaemonSession. Deferred schedule runs are isolated even though their
+ * visible delivery surface is a chat. */
+export function storedSessionAnchorId(
+  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'deferredScheduleRun'>,
+): string {
+  return session.deferredScheduleRun?.routingAnchor
+    ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
 /** Storage key for the daemon-owned activeSessions map. A VC receiver is a
@@ -361,4 +434,29 @@ export function activeSessionKey(ds: DaemonSession): string {
  * cards and other chat API calls must never target it. */
 export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>): boolean {
   return ds.scope === 'chat' && ds.chatId.startsWith('doc:');
+}
+
+/** A session created by the HTTP control API (`waitForFinalOutput` /
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
+ * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * targeting it (sendMessage / card / reply / roster probe) would fail — these
+ * sessions are request/response only and must never touch Lark transport. */
+export function isHttpVirtualSession(chatId: string): boolean {
+  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+}
+
+/** Central Lark-transport capability gate for a live session. Returns false —
+ * meaning "no Feishu side effects are permitted for this session" — when either
+ * the owning bot is core-only (`apiOnly`, never connected to Feishu) OR the
+ * session's surface is a synthetic HTTP virtual chat. Every auxiliary-UI /
+ * reply / card / roster seam should fail-closed on `!larkTransportEnabled(...)`
+ * instead of re-deriving the condition, so a new no-Feishu surface is covered
+ * everywhere by construction. `doc:` sessions keep their own dedicated routing
+ * (comment API), so they are intentionally NOT folded in here. */
+export function larkTransportEnabled(
+  ds: Pick<DaemonSession, 'chatId'> & { apiOnly?: boolean },
+): boolean {
+  if (ds.apiOnly === true) return false;
+  if (isHttpVirtualSession(ds.chatId)) return false;
+  return true;
 }

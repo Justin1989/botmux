@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CliAdapter, McpGatewayInstallSpec } from '../../../adapters/cli/types.js';
@@ -27,8 +27,17 @@ export interface GatewayEntry {
 }
 
 export function defaultGatewayEntry(): GatewayEntry {
+  // Canonicalize $HOME: on a symlinked-home host (/home/u → /data00/home/u) the
+  // lexical path is written into the CLI's MCP config, but the file sandbox binds
+  // only CANONICAL exec dirs — the lexical /home/u prefix doesn't exist in the
+  // bwrap root, so codex/gemini's `botmux mcp serve` launch fails with
+  // "No such file or directory" and MCP startup aborts. realpath the home root
+  // so the command path lands on a bound dir. Same file off-sandbox, so it's a
+  // safe no-op on non-symlinked hosts.
+  let home = homedir();
+  try { home = realpathSync(home); } catch { /* keep lexical if unresolvable */ }
   return {
-    command: process.env.BOTMUX_BIN_PATH ?? join(homedir(), '.botmux', 'bin', 'botmux'),
+    command: process.env.BOTMUX_BIN_PATH ?? join(home, '.botmux', 'bin', 'botmux'),
     args: ['mcp', 'serve'],
   };
 }

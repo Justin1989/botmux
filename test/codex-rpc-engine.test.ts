@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
 
@@ -29,6 +29,150 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(engine.activeThreadId).toBe('thread-fake-1');
     expect(engine.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
     await engine.sendTurn('hello world'); // resolves on the ack, no throw
+    await engine.waitForThreadPreview();
+    await engine.setThreadName('[BotMux·Lark] hello world');
+    engine.stop();
+  }, 20_000);
+
+  it('waits for a delayed first-message preview before allowing the final title write', async () => {
+    const engine = makeEngine({
+      sessionId: 'delayed-preview',
+      env: { ...process.env, FAKE_PREVIEW_DELAY_READS: '2' },
+    });
+    await engine.start();
+    await engine.startThread();
+    expect(await engine.waitForThreadPreview()).toBe('<botmux_routing> first message preview');
+    await engine.setThreadName('[BotMux·Lark] final title');
+    engine.stop();
+  }, 20_000);
+
+  it('sets the final title when the first-message preview remains unavailable', async () => {
+    const engine = makeEngine({
+      sessionId: 'missing-preview',
+      env: { ...process.env, FAKE_PREVIEW_DELAY_READS: '999999' },
+    });
+    await engine.start();
+    await engine.startThread();
+    expect(await engine.waitForThreadPreview(200)).toBeUndefined();
+    await engine.setThreadName('[BotMux·Lark] final title');
+    expect((await engine.readThreadMetadata()).name).toBe('[BotMux·Lark] final title');
+    engine.stop();
+  }, 20_000);
+
+  it('forwards model + reasoningEffort (xhigh verbatim) into thread/start config', async () => {
+    // Guards the PR-A consumption gap codex caught: the engine must actually put
+    // model + model_reasoning_effort on thread/start config, and xhigh must NOT
+    // be downgraded (codex 0.145 accepts it).
+    const cfgFile = join(tmpdir(), `fake-thread-cfg-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'effort-wiring',
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'xhigh',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: cfgFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    engine.stop();
+    const params = JSON.parse(readFileSync(cfgFile, 'utf8'));
+    rmSync(cfgFile, { force: true });
+    expect(params.config?.model).toBe('gpt-5.6-terra');
+    expect(params.config?.model_reasoning_effort).toBe('xhigh');
+  }, 20_000);
+
+  it('SUPPRESSES model + reasoningEffort on thread/resume (start keeps both) — no resume drift', async () => {
+    // Regression lock for the PR #639 P2: a cold resume must send NEITHER
+    // config.model NOR config.model_reasoning_effort, or the app-server's
+    // model-resume-override short-circuit drops the persisted {model, provider,
+    // effort} triple to the current default. Fresh start still stamps both.
+    // Asserts start-keeps AND resume-drops in ONE engine lifecycle so the two
+    // paths can't silently converge. This locks the full-override face; the
+    // model-only and effort-only faces are locked independently below (each is a
+    // distinct short-circuit trigger, so no single test subsumes the others).
+    const startFile = join(tmpdir(), `fake-start-cfg-${Math.round(performance.now())}.json`);
+    const resumeFile = join(tmpdir(), `fake-resume-cfg-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'resume-suppress',
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'xhigh',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: startFile, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const startParams = JSON.parse(readFileSync(startFile, 'utf8'));
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(startFile, { force: true });
+    rmSync(resumeFile, { force: true });
+    // start (positive): both present, xhigh verbatim
+    expect(startParams.config?.model).toBe('gpt-5.6-terra');
+    expect(startParams.config?.model_reasoning_effort).toBe('xhigh');
+    // resume (negative): NEITHER present — the whole point of the fix
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+  }, 20_000);
+
+  it('SUPPRESSES a stable configured model on thread/resume (pre-existing shared-engine face)', async () => {
+    // Covers the pre-existing model-only drift the same fix closes: even a model
+    // that never changes (a TraeX/codex bot's configured model, no per-turn
+    // effort) must NOT be re-sent on resume, else provider drifts. engine has no
+    // cliId — this one assertion covers both codex and TraeX.
+    const resumeFile = join(tmpdir(), `fake-resume-model-only-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'resume-model-only',
+      model: 'gpt-5.6-terra', // configured model, no reasoningEffort
+      env: { ...process.env, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(resumeFile, { force: true });
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+    // sanity: resume still carries the non-model params it must (env policy)
+    expect(resumeParams.config?.shell_environment_policy).toBeTruthy();
+  }, 20_000);
+
+  it('SUPPRESSES an effort-only override on thread/resume (the exact entry PR #639 newly activated)', async () => {
+    // The combination-sensitive face codex asked to lock independently: model
+    // ABSENT, reasoningEffort SET. This is the path PR #639 opened (worker.ts:709
+    // first fed effort into the engine), and it is a DISTINCT short-circuit
+    // trigger from model-only — the app-server early-returns on ANY single
+    // model-related key, so sending only model_reasoning_effort still drifts. The
+    // full-override and model-only tests above do NOT subsume it (both set model).
+    const resumeFile = join(tmpdir(), `fake-resume-effort-only-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'resume-effort-only',
+      reasoningEffort: 'xhigh', // effort set, model deliberately left unset
+      env: { ...process.env, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(resumeFile, { force: true });
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+    // sanity: resume still carries the non-model params it must (env policy)
+    expect(resumeParams.config?.shell_environment_policy).toBeTruthy();
+  }, 20_000);
+
+  it('waits for resumed-thread metadata to advance before restoring its title', async () => {
+    const engine = makeEngine({
+      sessionId: 'resume-title',
+      env: {
+        ...process.env,
+        FAKE_UPDATED_DELAY_READS: '2',
+        FAKE_UPDATED_BEFORE: '100',
+        FAKE_UPDATED_AFTER: '101',
+      },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-resumed-title');
+    expect((await engine.readThreadMetadata()).updatedAt).toBe(100);
+    await engine.waitForThreadUpdatedAfter(100);
+    await engine.setThreadName('[BotMux·Lark] resumed title');
     engine.stop();
   }, 20_000);
 
@@ -37,6 +181,77 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.start();
     const tid = await engine.resumeThread('thread-persisted-42');
     expect(tid).toBe('thread-persisted-42');
+    engine.stop();
+  }, 20_000);
+
+  it('bridges requestUserInput server requests to the host callback', async () => {
+    let received: unknown;
+    let resolveReceived!: () => void;
+    const receivedPromise = new Promise<void>(resolve => { resolveReceived = resolve; });
+    const engine = makeEngine({
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      onRequestUserInput: async params => {
+        received = params;
+        resolveReceived();
+        return { answers: { choice: { answers: ['Yes'] } } };
+      },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('ask me');
+    await receivedPromise;
+    expect(received).toMatchObject({
+      questions: [{ id: 'choice', question: 'Continue?' }],
+    });
+    engine.stop();
+  }, 20_000);
+
+  it('interrupts the turn (not a benign reply) when the input bridge rejects', async () => {
+    // The blocker fix. Verified against real traex 0.200.19: replying to
+    // requestUserInput with empty answers OR a JSON-RPC error is normalized to
+    // {answers:{}} and the turn still COMPLETES, silently skipping the ask. Only
+    // `turn/interrupt` actually stops the turn. So on bridge rejection the engine
+    // must send turn/interrupt — asserted here via the engine log + the fixture
+    // resolving turn/start as an interrupted turn rather than a completed one.
+    const logs: string[] = [];
+    const engine = makeEngine({
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      log: (m: string) => logs.push(m),
+      onRequestUserInput: async () => { throw new Error('cannot represent as ask card'); },
+    });
+    await engine.start();
+    await engine.startThread();
+    // turn/start resolves (interrupted), so sendTurn does not throw here; the
+    // point is that the turn was stopped, not silently completed.
+    await engine.sendTurn('ask me');
+    // Give the async interrupt round-trip a moment to log its result.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(logs.some(l => l.includes('interrupting turn'))).toBe(true);
+    expect(logs.some(l => l.includes('turn interrupted after requestUserInput failure'))).toBe(true);
+    engine.stop();
+  }, 20_000);
+
+  it('declares the engine dead when turn/interrupt itself fails (no permanently wedged turn)', async () => {
+    // The interrupt is the last lever we have on bridge failure. If it errors or
+    // times out, the turn stays stuck — so the engine must fire onDead so the
+    // worker restarts the pane, rather than only logging and leaking the hang.
+    let deadCount = 0;
+    const engine = makeEngine({
+      sessionId: 'interrupt-fail',
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1', FAKE_INTERRUPT_ERROR: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      onRequestUserInput: async () => { throw new Error('cannot represent as ask card'); },
+      onDead: () => { deadCount++; },
+    });
+    await engine.start();
+    await engine.startThread();
+    // failAll rejects the still-pending turn/start, so sendTurn rejects here —
+    // that is the visible failure, not a silent hang. We only care that onDead fired.
+    await engine.sendTurn('ask me').catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(deadCount).toBe(1);
     engine.stop();
   }, 20_000);
 });

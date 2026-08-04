@@ -41,6 +41,21 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([{ content: '<legacy />', turnId: 'om_1', codexAppInput }]);
   });
 
+  it('preserves logical content for a deferred transport command across crash replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    }]);
+  });
+
   it('completed turn: idle clears in-flight, a later crash re-queues nothing', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('hello'));
@@ -109,6 +124,19 @@ describe('InflightInputTracker', () => {
 
     expect(t.onCliExit()).toBe(2);
     expect(t.takeCarryOver().map(i => i.content)).toEqual(['msg-1', 'msg-2']);
+  });
+
+  it('retires only an ambiguous write so a restart cannot blindly replay it', () => {
+    const t = new InflightInputTracker();
+    const ambiguous = item('possibly submitted', 'a');
+    const later = item('not attempted yet', 'b');
+    t.onWrite(ambiguous);
+    t.onWrite(later);
+
+    expect(t.retire(ambiguous)).toBe(true);
+    expect(t.retire(ambiguous)).toBe(false);
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([later]);
   });
 
   it('double exit before respawn keeps the earlier stash (appends, not replaces)', () => {

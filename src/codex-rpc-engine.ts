@@ -68,6 +68,11 @@ export interface CodexRpcEngineOpts {
   /** Optional model + reasoning effort forwarded to thread config (P1). */
   model?: string;
   reasoningEffort?: string;
+  /** Feature gates owned by the app-server process (the viewer TUI does not
+   *  execute model tools in RPC mode). */
+  appServerFeatures?: string[];
+  /** Bridge a native request_user_input server request to the host UI. */
+  onRequestUserInput?: (params: unknown) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
    *  Mainly for tests that assert the wedged-app-server recovery path. */
   requestTimeoutMs?: number;
@@ -99,6 +104,16 @@ const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
  *  FIRST turn on a cold app-server pays MCP/model-list startup latency. */
 const REQUEST_TIMEOUT_MS = 60_000;
 
+/** Floor for a metadata-poll iteration's per-request budget. Below this, the
+ *  poll deadline is effectively reached: issuing a thread/read with a
+ *  sub-floor client timeout would reliably time out (and REJECT, not return)
+ *  before even a fast response lands, and that rejection would escape the poll
+ *  loop instead of degrading to "not found". Guards waitForThreadPreview /
+ *  waitForThreadUpdatedAfter against a flaky end-of-window request. 50ms is
+ *  comfortably above localhost RPC round-trip yet negligible vs the callers'
+ *  200ms–10s budgets. */
+const MIN_POLL_REQUEST_BUDGET_MS = 50;
+
 export class CodexRpcEngine {
   private child?: ChildProcess;
   private ws?: WebSocket;
@@ -123,7 +138,8 @@ export class CodexRpcEngine {
   async start(): Promise<void> {
     this.reapStaleAppServer();
     this.port = await findFreePort();
-    this.child = spawn(this.opts.cliBin, ['app-server', '--listen', `ws://127.0.0.1:${this.port}`], {
+    const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
+    this.child = spawn(this.opts.cliBin, ['app-server', ...featureArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -163,21 +179,37 @@ export class CodexRpcEngine {
    *  so RPC mode stays engaged across daemon restarts instead of reverting to
    *  the paste path. */
   async resumeThread(threadId: string): Promise<string> {
-    const params: Json = { ...this.threadParams(), threadId, excludeTurns: true };
+    // forResume=true: a cold resume must NOT re-send ANY model-related override.
+    // The codex/TraeX app-server sees any single override (model OR
+    // model_reasoning_effort) as "caller is pinning config" and early-returns out
+    // of `merge_persisted_resume_metadata`, dropping the rest of the persisted
+    // {model, model_provider, reasoning_effort} triple back to the CURRENT
+    // process default. Re-sending only effort (per-turn override, new in PR #639)
+    // — or even the stable configured model (pre-existing on the shared engine) —
+    // therefore silently drifts model/provider whenever the app-server default
+    // changed between restarts. Verified on codex-cli 0.145.0 + traecli 0.200.19.
+    // The safe path is to send nothing model-related and let the app-server
+    // restore the full persisted triple. Fresh thread/start still stamps both.
+    const params: Json = { ...this.threadParams(true), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
     const r = await this.request('thread/resume', params);
     this.threadId = String(r?.thread?.id ?? threadId);
     return this.threadId;
   }
 
-  private threadParams(): Json {
+  private threadParams(forResume = false): Json {
     const config: Json = {
       // Forward the full env (incl. BOTMUX_SESSION_ID / BOTMUX_LARK_APP_ID) to
       // shell subprocesses so `botmux send` from within codex finds its bot.
       shell_environment_policy: { inherit: 'all', ignore_default_excludes: true },
     };
-    if (this.opts.model) config.model = this.opts.model;
-    if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
+    // Only stamp model/effort on a FRESH thread/start. On resume the app-server
+    // owns restoration of the persisted triple (see resumeThread) — sending
+    // either here would trip the app-server's model-resume-override short-circuit.
+    if (!forResume) {
+      if (this.opts.model) config.model = this.opts.model;
+      if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
+    }
     return {
       cwd: this.opts.cwd,
       approvalPolicy: 'never',
@@ -209,6 +241,67 @@ export class CodexRpcEngine {
     };
     if (clientUserMessageId) params.clientUserMessageId = clientUserMessageId;
     await this.request('turn/start', params, opts);
+  }
+
+  /** 首条用户消息落盘后设置线程名；失败不得拖垮仍在执行的模型 turn。 */
+  async setThreadName(name: string): Promise<void> {
+    if (!this.threadId) throw new Error('setThreadName before startThread/resumeThread');
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await this.request('thread/name/set', {
+        threadId: this.threadId,
+        name,
+      }, { timeoutMs: 7000, fatalOnTimeout: false });
+      if ((await this.readThreadMetadata(7000)).name === name) return;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    throw new Error('Codex thread name did not persist after 3 attempts');
+  }
+
+  /** 等待 Codex 的首条消息预览落盘；超时后由调用方继续设置标题。 */
+  async waitForThreadPreview(timeoutMs = 10_000): Promise<string | undefined> {
+    if (!this.threadId) throw new Error('waitForThreadPreview before startThread/resumeThread');
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      // A near-expired budget must not issue a doomed tiny-timeout thread/read:
+      // readThreadMetadata rejects (not returns) on request timeout, and that
+      // rejection would escape this poll instead of degrading to "not found".
+      // Below the floor the deadline is effectively reached — return undefined.
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return undefined;
+      const { preview } = await this.readThreadMetadata(Math.min(remaining, 2000));
+      if (preview) return preview;
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+    }
+  }
+
+  /** 等待 resume 后首次 append 的元数据补丁落库；超时后由调用方继续做最终覆盖。 */
+  async waitForThreadUpdatedAfter(baseline: number, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      // Same near-expiry guard as waitForThreadPreview: don't issue a tiny-timeout
+      // request that would reject and escape; treat sub-floor remaining as done.
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return;
+      const { updatedAt } = await this.readThreadMetadata(Math.min(remaining, 2000));
+      if (updatedAt !== undefined && updatedAt > baseline) return;
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+    }
+  }
+
+  async readThreadMetadata(timeoutMs = 7000): Promise<{ name?: string; preview?: string; updatedAt?: number }> {
+    if (!this.threadId) throw new Error('readThreadMetadata before startThread/resumeThread');
+    const result = await this.request('thread/read', {
+      threadId: this.threadId,
+      includeTurns: false,
+    }, { timeoutMs, fatalOnTimeout: false });
+    const name = typeof result?.thread?.name === 'string' ? result.thread.name.trim() : '';
+    const preview = typeof result?.thread?.preview === 'string' ? result.thread.preview.trim() : '';
+    const updatedAt = typeof result?.thread?.updatedAt === 'number' ? result.thread.updatedAt : undefined;
+    return {
+      ...(name ? { name } : {}),
+      ...(preview ? { preview } : {}),
+      ...(updatedAt !== undefined ? { updatedAt } : {}),
+    };
   }
 
   /** Deliver the FRESH first turn and resolve its outcome as one of THREE states,
@@ -418,6 +511,40 @@ export class CodexRpcEngine {
     try { this.send({ jsonrpc: '2.0', id, result }); } catch { /* connection gone */ }
   }
 
+  /** Fail a native user-input request by INTERRUPTING its turn instead of
+   *  replying. Verified on real traex 0.200.19: replying with either empty
+   *  answers or a JSON-RPC error is normalized to `{answers:{}}` and the turn
+   *  still completes (the ask is silently skipped). `turn/interrupt` is the only
+   *  path that actually stops the turn (status → 'interrupted'); the pending
+   *  server request is cancelled along with it, so we do NOT also respond. */
+  private interruptTurnFor(id: number, params: unknown, reason: string): void {
+    const p = (params && typeof params === 'object') ? params as Record<string, unknown> : {};
+    const threadId = typeof p.threadId === 'string' ? p.threadId : undefined;
+    const turnId = typeof p.turnId === 'string' ? p.turnId : undefined;
+    if (!threadId || !turnId) {
+      // No turn coordinates to interrupt: fall back to a JSON-RPC error so at
+      // least the request does not hang the app-server waiting on a reply.
+      this.log(`[codex-rpc] requestUserInput failure without threadId/turnId; replying error (${reason})`);
+      this.respondError(id, reason);
+      return;
+    }
+    this.request('turn/interrupt', { threadId, turnId }, { timeoutMs: 10_000, fatalOnTimeout: false })
+      .then(() => this.log('[codex-rpc] turn interrupted after requestUserInput failure'))
+      .catch(err => {
+        // If the interrupt itself errors or times out, the turn is still wedged
+        // and we have no other lever. Declare the engine dead so the worker
+        // replaces the pane (onDead → restartCliProcess) rather than leaking a
+        // permanently stuck turn — the whole point of this failure path.
+        this.failAll(new Error(`turn/interrupt failed: ${err instanceof Error ? err.message : String(err)}`));
+      });
+  }
+
+  /** Reply to a server→client request with a JSON-RPC error. Used only as a
+   *  last resort when a failed requestUserInput has no turn to interrupt. */
+  private respondError(id: number, message: string): void {
+    try { this.send({ jsonrpc: '2.0', id, error: { code: -32000, message } }); } catch { /* connection gone */ }
+  }
+
   private send(msg: Json): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('app-server ws not open');
     this.ws.send(JSON.stringify(msg));
@@ -436,8 +563,29 @@ export class CodexRpcEngine {
       else p.resolve(msg.result);
       return;
     }
-    // Server→client request (approvals / elicitations): auto-answer.
+    // Native user-input requests are the one server→client request that must
+    // wait for a human. In botmux this callback posts a Lark card and returns
+    // the protocol-shaped answers object. Keep all approval requests automatic.
     if (typeof msg.id === 'number' && typeof msg.method === 'string') {
+      if (msg.method === 'item/tool/requestUserInput' && this.opts.onRequestUserInput) {
+        const requestParams = msg.params;
+        void this.opts.onRequestUserInput(requestParams).then(
+          result => this.respond(msg.id, result),
+          err => {
+            // Fail VISIBLY, never silently. Verified against real traex 0.200.19:
+            // ANY response to this request — empty answers OR a JSON-RPC error —
+            // is normalized by the app-server into `{answers:{}}` and the turn
+            // still COMPLETES, so unsupported/broker-failed asks would be
+            // silently skipped. Only `turn/interrupt` (threadId+turnId, both
+            // carried in this request's params) actually stops the turn
+            // (status → 'interrupted'). So fail by interrupting the turn.
+            const message = err instanceof Error ? err.message : String(err);
+            this.log(`[codex-rpc] requestUserInput bridge failed: ${message}; interrupting turn`);
+            this.interruptTurnFor(msg.id, requestParams, message);
+          },
+        );
+        return;
+      }
       this.respond(msg.id, autoApproval(msg.method));
       return;
     }

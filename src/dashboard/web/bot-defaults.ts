@@ -1,4 +1,5 @@
 import { store } from './store.js';
+import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 
 export type CliOption = {
   id: string;
@@ -16,6 +17,10 @@ export type CliOptionsState = {
   ttadkModelSuggestions: string[];
 };
 
+/** Keep the browser payload contract tied to the daemon's canonical schema. */
+export type CliRuntimeConfig = SharedCliRuntimeConfig;
+export type CliRuntimeUpdateProvider = NonNullable<SharedCliRuntimeConfig['update']>['provider'];
+
 export type BotSubstituteTarget = {
   openId?: string;
   userId?: string;
@@ -30,6 +35,7 @@ export type BotSubstituteMode = {
   targets: BotSubstituteTarget[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
+  excludedChats?: string[];
   replyMode?: 'thread' | 'quote';
   disableControlCard?: boolean;
   /** 话题群支持（缺省 true；显式 false 关）。 */
@@ -42,6 +48,10 @@ export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** Absent/null is the built-in runtime. Older dashboard payloads omit it. */
+  cliRuntime?: CliRuntimeConfig | null;
+  /** Legacy path-only executable override, returned only by private Bot Defaults APIs. */
+  cliPathOverride?: string | null;
   wrapperCli?: string | null;
   model?: string;
   agentSelectionKey?: string;
@@ -51,16 +61,22 @@ export type BotDefaultsRow = {
   autoboundChatCount?: number;
   brandLabel?: string | null;
   sandbox?: boolean;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
+   *  null/absent = none configured (pure deny-by-default baseline). */
+  sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  usageDisplay?: 'streaming' | 'footer' | 'off';
+  usageSupported?: boolean;
   disableStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };
   p2pMode?: string;
@@ -73,6 +89,8 @@ export type BotDefaultsRow = {
   residentSessionCount?: number;
   dormantSessionCount?: number;
   startupCommands?: string;
+  customPassthroughCommands?: string;
+  canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
   riff?: Record<string, unknown> | null;
@@ -137,6 +155,26 @@ export function selectedCliOption(options: CliOption[], key: string): CliOption 
 export function modelSuggestionsForOption(opt: CliOption | undefined, cliState: CliOptionsState): string[] {
   if (opt?.gateway === 'ttadk' && opt.acceptsModel !== false) return cliState.ttadkModelSuggestions;
   return [];
+}
+
+/**
+ * Latest-wins guard for overlapping async refreshes. The Bot 配置 page fires an
+ * initial refresh on mount and another on every `bots.changed` SSE event; these
+ * can overlap, and a slow earlier `/api/bots` response arriving *after* a newer
+ * one ("后发先回") would otherwise clobber the fresher roster and re-hide a
+ * just-added bot. Each call bumps a monotonic counter and hands back a `commit`
+ * predicate that is only true while this call is still the newest — the caller
+ * gates BOTH its state write and its `loading=false` on it. Kept as a tiny
+ * pure factory so the race is unit-testable without a DOM.
+ */
+export function createRefreshGate(): { begin(): { commit(): boolean } } {
+  let latest = 0;
+  return {
+    begin() {
+      const seq = ++latest;
+      return { commit: () => seq === latest };
+    },
+  };
 }
 
 export async function fetchBotDefaults(): Promise<LoadBotsResult> {

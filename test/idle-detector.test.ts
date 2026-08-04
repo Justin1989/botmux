@@ -186,29 +186,13 @@ describe('IdleDetector: quiescence detection', () => {
     detector.dispose();
   });
 
-  it('does not mark idle while an explicit busy marker remains on screen', () => {
+  it('still reports quiescence after static busy output', () => {
     const detector = new IdleDetector(makeCli({ busyPattern: /Working\.\.\./ }));
     const cb = vi.fn();
     detector.onIdle(cb);
 
     detector.feed('Tool 3.3s\nWorking...');
     vi.advanceTimersByTime(10_000);
-
-    expect(cb).not.toHaveBeenCalled();
-    detector.dispose();
-  });
-
-  it('allows quiescence after the ready prompt replaces a busy marker', () => {
-    const detector = new IdleDetector(makeCli({
-      busyPattern: /Working…|esc to interrupt/i,
-      readyPattern: /❯\s*$/,
-    }));
-    const cb = vi.fn();
-    detector.onIdle(cb);
-
-    detector.feed('Working… esc to interrupt');
-    detector.feed('\n❯ ');
-    vi.advanceTimersByTime(2_000);
 
     expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();

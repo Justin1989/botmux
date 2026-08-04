@@ -126,6 +126,37 @@ describe('worker pipe initial screen ordering', () => {
     expect(probeIdx).toBeGreaterThan(releaseIdx);
   });
 
+  it('keeps polling an argv-baked Pi turn while its authoritative viewport is busy', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
+    const releaseIdx = source.indexOf('awaitingFirstPrompt = false;', fallbackStart);
+    const deferIdx = source.indexOf('deferPromptReadyWhileBusy(`${cliName()} first-prompt-timeout`, backend)', releaseIdx);
+    const directProbeIdx = source.indexOf('probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)', releaseIdx);
+    const helperStart = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
+    const helperEnd = source.indexOf('async function spawnCli(', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+
+    expect(deferIdx).toBeGreaterThan(releaseIdx);
+    expect(directProbeIdx).toBeGreaterThan(deferIdx);
+    expect(helper).not.toContain('IDLE_PROBE_MAX_ATTEMPTS');
+  });
+
+  it('defers screen-idle completion when the authoritative viewport remains busy', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
+    const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
+    const idle = source.slice(idleStart, idleEnd);
+    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)");
+    const drainIdx = idle.indexOf('drainBridgesThenMarkReady(evidenceSource);');
+    const adoptStart = source.indexOf('function setupAdoptIdleDetection');
+    const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);
+    const adopt = source.slice(adoptStart, adoptEnd);
+
+    expect(deferIdx).toBeGreaterThan(-1);
+    expect(deferIdx).toBeLessThan(drainIdx);
+    expect(adopt).toContain("deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)");
+  });
+
   it('gates the first-prompt soft timeout through shouldReleaseFirstPromptTimeout with a hard cap', () => {
     // Pin the defer-then-hard-cap structure, not just the probe ordering. Without
     // this, reverting the closure to an unconditional 15s force-flush (the exact

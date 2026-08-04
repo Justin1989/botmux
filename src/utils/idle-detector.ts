@@ -18,11 +18,14 @@ export class IdleDetector {
   private idleCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
   private readyPattern: RegExp | undefined;
+  private busyPattern: RegExp | undefined;
   private readySeen = false;
+  private busySeen = false;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
     this.readyPattern = cli.readyPattern;
+    this.busyPattern = cli.busyPattern;
   }
 
   onIdle(cb: () => void): void {
@@ -38,6 +41,7 @@ export class IdleDetector {
       this.isIdle = false;
       this.outputTail = '';
       this.readySeen = false;
+      this.busySeen = false;
       this.lastSpinnerAt = Date.now();
     }
 
@@ -48,10 +52,18 @@ export class IdleDetector {
     // Check the current chunk too — a single chunk can contain the prompt
     // AND a full status-bar redraw (hundreds of chars), pushing the prompt
     // out of the 500-char outputTail before the check runs.
-    if (this.readyPattern && !this.readySeen) {
-      if (this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)) {
-        this.readySeen = true;
-      }
+    const readyMatched = this.readyPattern && (
+      this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)
+    );
+    if (readyMatched) {
+      this.readySeen = true;
+    }
+
+    if (this.busyPattern?.test(stripped) || this.busyPattern?.test(this.outputTail)) {
+      this.busySeen = true;
+    }
+    if (readyMatched) {
+      this.busySeen = false;
     }
 
     // Track spinner — but not if it's part of completion marker,
@@ -85,6 +97,7 @@ export class IdleDetector {
     this.isIdle = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.busySeen = false;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
   }
@@ -115,6 +128,7 @@ export class IdleDetector {
       );
       return;
     }
+    if (this.busySeen) return;
     this.markIdle();
   }
 

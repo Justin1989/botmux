@@ -141,6 +141,29 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).not.toContain('IDLE_PROBE_MAX_ATTEMPTS');
   });
 
+  it('never arms the uncapped busy probe on a non-authoritative backend (ZMX)', () => {
+    // Regression for the ZMX lifecycle leak: with IDLE_PROBE_MAX_ATTEMPTS removed
+    // the probe re-arms on `!isPromptReady` forever. probeBusyPatternIdle() bails
+    // at the authoritative gate every tick and can never mark ready on ZMX, and
+    // an alt-screen CLI's busy→idle redraw arrives as a screen-resync that is
+    // deliberately NOT fed to IdleDetector — so nothing else flips isPromptReady.
+    // The arm gate MUST short-circuit before scheduling the first tick, or a live
+    // worker logs a skip line every IDLE_PROBE_INTERVAL_MS with no terminator.
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
+    const helperEnd = source.indexOf('async function spawnCli(', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+    const guardIdx = helper.indexOf('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+    const firstArmIdx = helper.indexOf('busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);');
+
+    // The authoritative guard exists and precedes any timer arm.
+    expect(guardIdx).toBeGreaterThan(-1);
+    expect(firstArmIdx).toBeGreaterThan(-1);
+    expect(guardIdx).toBeLessThan(firstArmIdx);
+    // The cap is gone (unbounded re-arm), which is exactly why the guard is load-bearing.
+    expect(helper).not.toContain('IDLE_PROBE_MAX_ATTEMPTS');
+  });
+
   it('defers screen-idle completion when the authoritative viewport remains busy', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const idleStart = source.search(/idleDetector\.onIdle\(async \(/);

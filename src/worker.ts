@@ -7382,6 +7382,18 @@ function stopBusyPatternIdleProbe(): void {
 function scheduleBusyPatternIdleProbe(source: string): void {
   stopBusyPatternIdleProbe();
   if (!cliAdapter?.busyPattern || !backend || !canCaptureBusyPatternScreen(backend)) return;
+  // Don't arm on a backend whose screen geometry is not authoritative for
+  // mutation (ZMX): probeBusyPatternIdle() bails at that same gate every tick
+  // and can never mark ready, so — with the attempt cap now removed — the timer
+  // would re-arm on `!isPromptReady` forever. On ZMX an alt-screen CLI's
+  // busy→idle redraw arrives as a screen-resync (reset-only, deliberately not
+  // fed to IdleDetector — see onBackendScreenResync), so screen quiescence never
+  // flips isPromptReady either; a Pi turn ending via a `terminate:true` custom
+  // tool (no assistant_final → no fireIdle) would then leave a live worker
+  // logging a skip line every IDLE_PROBE_INTERVAL_MS with no terminator. The
+  // authoritative screen-idle path (settle + drainBridgesThenMarkReady) already
+  // owns completion for these backends.
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
 
   const tick = () => {
     busyPatternIdleProbeTimer = null;

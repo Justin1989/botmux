@@ -13635,8 +13635,19 @@ async function spawnCli(
           log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
         }
       }
-      if (evidenceSource === 'screen' && idleBackend
-        && deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)) return;
+      // Pi's transcript final (assistant_final) is persisted asynchronously
+      // from the TUI clearing its `Working...` busy marker — either order
+      // occurs. An external idle landing while the authoritative viewport
+      // still shows busy must defer exactly like a screen idle, or the card
+      // flips to 等待输入 mid-turn. Scoped to Pi: Grok/Codex own their idle
+      // via reliableTurnTerminal / lifecycle blocking, and their busy markers
+      // legitimately lag behind the transcript final. deferPromptReadyWhileBusy
+      // itself fail-opens on non-authoritative screens (ZMX), so a stale
+      // `Working...` in ZMX history can never block a structured terminal.
+      const busyGuardedIdle = evidenceSource === 'screen'
+        || (evidenceSource === 'external' && structuredBridgeIsPi());
+      if (busyGuardedIdle && idleBackend
+        && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       drainBridgesThenMarkReady(evidenceSource);
     });
   }

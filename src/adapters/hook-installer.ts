@@ -111,13 +111,27 @@ function botmuxHookSuffix(hookCommand: string): string {
  * ⚠️ 旧实现用 `command.includes('cli.js')` 来识别 botmux hook——这在 Node 态成立
  * （命令是 `"<node>" "<...>/dist/cli.js" <subcommand>`），但**编译态（单文件二进制）**
  * 下 `renderShellCommand` 写的是打包二进制路径 `"<...>/botmux-linux-x64/botmux" <subcommand>`，
- * 根本不含 `cli.js`。旧判据因此把已装 hook 误判为「未安装」，三条去重全部失效、重复追加，
- * 最终在 settings.json 里堆出重复 hook。
+ * 根本不含 `cli.js`。旧判据因此把已装 hook 误判为「未安装」。
+ *
+ * 后果分两种，别记成「三条一起失效」（实测口径）：
+ *   - `session-ready` / `user-prompt-hook`：**每次安装都追加一条**。而 installHook 在
+ *     read-isolation 路径下**每次冷 spawn 都会跑**（worker.ts `provisionIsolatedBotHome`），
+ *     所以编译态盒子每开一个会话就 +1、无上限；已堆坏的盒子再装一次只会继续涨。
+ *   - ask（`hook <cliId>`）：**通常不叠**——`isBotmuxAskHookGroup` 还有一条
+ *     `e.command === hookCommand` 精确匹配分支，命令字符串不变时由它兜住；只有命令
+ *     形态发生变化（如二进制↔Node 互切）时才会叠加。
  *
  * 稳定、与运行时形态无关的信号是 **子命令尾签名**（`hook <cliId>` / `session-ready` /
  * `user-prompt-hook`），加上调用目标名：Node 态是脚本 `cli.js`，编译态是可执行文件
  * `botmux`（`botmux-linux-x64/botmux` 的 basename 同为 `botmux`；Windows 上为 `botmux.exe`）。
  * 两者取其一即视为同一条 botmux hook，无论它指向哪个安装路径、由 node 还是打包二进制执行。
+ *
+ * ⚠️ basename 白名单**故意只认这三个字面量**，不要放宽成 `botmux-*` 前缀匹配：那会把
+ * 第三方同前缀程序（`botmux-helper` / `botmux-wrapper` 等）也当成自己的 hook 删掉。
+ * 已知未覆盖形态：本地 `bun run use:here --binary` 指向的 `dist-bin/botmux-<plat>-<arch>`
+ * （basename 带平台后缀）。生产两条安装路径都落在 `botmux` 上（npm 平台子包
+ * `…/node_modules/botmux-<plat>-<arch>/botmux`、install.sh 的 `~/.botmux/bin/botmux`），
+ * 故仅影响开发机；真要覆盖须**枚举死平台后缀**而非放宽为任意后缀。
  */
 function isBotmuxHookCommand(command: string, suffix: string): boolean {
   const trimmed = command.trimEnd();

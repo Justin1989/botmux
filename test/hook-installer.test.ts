@@ -266,18 +266,59 @@ describe('installHook — claude-settings', () => {
     expect(hasInstalledPromptHook(hookInstall)).toBe(true);
   });
 
-  it('(i3) 打包二进制命令替换旧的 Node cli.js 命令（同一条 hook，两种形态互相去重）', () => {
+  it('(i3) Node cli.js 命令替换旧的打包二进制命令（两种形态互相去重）', () => {
+    // ⚠️ 方向很重要：这里必须 **先装二进制、再装 Node**。
+    // 反过来（先 Node 后二进制）旧判据 `includes('cli.js')` 也能认出被替换的旧条目
+    // （它含 cli.js），那条用例在**未修复的代码上照样绿** —— 测不到本次修复。
+    // 只有本方向能打死旧判据：旧条目是二进制命令、不含 cli.js，旧判据认不出 →
+    // 不删旧的、直接追加 → PreToolUse 变 2 条（实测 master 如此）。
     const binAsk = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" hook claude-code';
-    // 先装 Node 态（含 cli.js）
-    installHook('claude-code', { configPath, format: 'claude-settings' }, '/usr/bin/node /path/to/cli.js hook claude-code');
-    // 再用打包二进制命令重装，应替换旧的而非叠加
+    const nodeAsk = '/usr/bin/node /path/to/cli.js hook claude-code';
+    // 先装编译态（不含 cli.js）
     installHook('claude-code', { configPath, format: 'claude-settings' }, binAsk);
+    // 再用 Node 态命令重装，应替换旧的而非叠加
+    installHook('claude-code', { configPath, format: 'claude-settings' }, nodeAsk);
 
     const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
     const asks: any[] = settings.hooks?.PreToolUse ?? [];
     const askGroups = asks.filter((g) => g.matcher === 'AskUserQuestion');
     expect(askGroups.length).toBe(1);
-    expect(askGroups[0].hooks[0].command).toBe(binAsk);
+    expect(askGroups[0].hooks[0].command).toBe(nodeAsk);
+  });
+
+  it('(i4) 已堆叠的重复条目在一次安装后收敛为单条（存量自愈）', () => {
+    // 线上失效形态不是「装两次多一条」，而是 installHook 在 read-isolation 路径下
+    // **每次冷 spawn 都跑**（worker.ts provisionIsolatedBotHome），编译态盒子每开一个
+    // 会话就 +1、无上限。所以真正要守的性质是：**已经堆坏的 settings.json，装一次就收敛回 1**。
+    // 实测未修复的代码在此场景下不仅不收敛，还会继续叠（5 条 → 6 条）。
+    const bin = '/opt/botmux/node_modules/botmux-linux-x64/botmux';
+    const binAsk = `"${bin}" hook claude-code`;
+    const binReady = `"${bin}" session-ready`;
+    const binPrompt = `"${bin}" user-prompt-hook`;
+
+    // 预置一份已经堆了 5 条重复 botmux 条目的 settings.json（模拟存量机器）
+    const stacked = (cmd: string) => Array.from({ length: 5 }, () => ({ hooks: [{ type: 'command', command: cmd }] }));
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        PreToolUse: Array.from({ length: 5 }, () => ({ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: binAsk }] })),
+        SessionStart: stacked(binReady),
+        UserPromptSubmit: stacked(binPrompt),
+      },
+    }, null, 2));
+
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: binReady,
+      userPromptSubmitCommand: binPrompt,
+    }, binAsk);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const askGroups = (settings.hooks?.PreToolUse ?? []).filter((g: any) => g.matcher === 'AskUserQuestion');
+    expect(askGroups).toHaveLength(1);
+    expect(settings.hooks?.SessionStart ?? []).toHaveLength(1);
+    expect(settings.hooks?.UserPromptSubmit ?? []).toHaveLength(1);
   });
 
   it('read-isolation inherits only the global Claude env map and refreshes rotated auth', () => {

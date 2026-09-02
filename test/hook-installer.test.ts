@@ -227,6 +227,59 @@ describe('installHook — claude-settings', () => {
     expect(ups.some((g) => g.hooks?.some((e: any) => e.command.endsWith('user-prompt-hook')))).toBe(true);
   });
 
+  it('(i2) 打包二进制命令（不含 cli.js）在重装时被去重，不重复追加', () => {
+    // 编译态单文件二进制写入的命令是打包二进制路径，根本不含 cli.js。
+    // 旧判据 `command.includes('cli.js')` 会把它永远误判为「未安装」，每次叠加一条。
+    const binAsk = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" hook claude-code';
+    const binReady = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" session-ready';
+    const binPrompt = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" user-prompt-hook';
+
+    const hookInstall = {
+      configPath,
+      format: 'claude-settings' as const,
+      sessionStartCommand: binReady,
+      userPromptSubmitCommand: binPrompt,
+    };
+    installHook('claude-code', hookInstall, binAsk);
+    const afterFirst = readFileSync(configPath, 'utf-8');
+
+    // 再装一次（幂等），内容与首次完全一致 → 说明三条去重都认出了二进制命令
+    installHook('claude-code', hookInstall, binAsk);
+    const afterSecond = readFileSync(configPath, 'utf-8');
+    expect(afterSecond).toBe(afterFirst);
+
+    const settings = JSON.parse(afterFirst);
+    const asks: any[] = settings.hooks?.PreToolUse ?? [];
+    const askGroups = asks.filter((g) => g.matcher === 'AskUserQuestion');
+    expect(askGroups.length).toBe(1);
+    expect(askGroups[0].hooks[0].command).toBe(binAsk);
+
+    const ss: any[] = settings.hooks?.SessionStart ?? [];
+    expect(ss).toHaveLength(1);
+    expect(ss[0].hooks[0].command).toBe(binReady);
+
+    const ups: any[] = settings.hooks?.UserPromptSubmit ?? [];
+    expect(ups).toHaveLength(1);
+    expect(ups[0].hooks[0].command).toBe(binPrompt);
+
+    // preflight 也应认出二进制命令
+    expect(hasInstalledPromptHook(hookInstall)).toBe(true);
+  });
+
+  it('(i3) 打包二进制命令替换旧的 Node cli.js 命令（同一条 hook，两种形态互相去重）', () => {
+    const binAsk = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" hook claude-code';
+    // 先装 Node 态（含 cli.js）
+    installHook('claude-code', { configPath, format: 'claude-settings' }, '/usr/bin/node /path/to/cli.js hook claude-code');
+    // 再用打包二进制命令重装，应替换旧的而非叠加
+    installHook('claude-code', { configPath, format: 'claude-settings' }, binAsk);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const asks: any[] = settings.hooks?.PreToolUse ?? [];
+    const askGroups = asks.filter((g) => g.matcher === 'AskUserQuestion');
+    expect(askGroups.length).toBe(1);
+    expect(askGroups[0].hooks[0].command).toBe(binAsk);
+  });
+
   it('read-isolation inherits only the global Claude env map and refreshes rotated auth', () => {
     const globalPath = join(tmpDir, '.claude-global', 'settings.json');
     mkdirSync(join(tmpDir, '.claude-global'), { recursive: true });

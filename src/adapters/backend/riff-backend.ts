@@ -838,44 +838,17 @@ const RIFF_IMAGE_MEDIA_TYPES = new Set([
   'image/gif',
 ]);
 
-/** Riff accepts these source/text files in addition to the four image types. */
+/** Riff's text attachment validator requires both a text media type and one of
+ * these exact filename suffixes. Keep this allowlist narrower than generic
+ * source-code detection so an accepted media type cannot bypass the suffix gate. */
 const RIFF_TEXT_MEDIA_TYPE_BY_EXTENSION: Record<string, string> = {
   '.md': 'text/markdown',
-  '.markdown': 'text/markdown',
-  '.html': 'text/html',
-  '.htm': 'text/html',
   '.json': 'application/json',
   '.csv': 'text/csv',
   '.txt': 'text/plain',
   '.log': 'text/plain',
-  '.jsonl': 'text/plain',
-  '.ndjson': 'text/plain',
   '.yaml': 'text/plain',
   '.yml': 'text/plain',
-  '.xml': 'text/plain',
-  '.diff': 'text/plain',
-  '.patch': 'text/plain',
-  '.js': 'text/plain',
-  '.jsx': 'text/plain',
-  '.ts': 'text/plain',
-  '.tsx': 'text/plain',
-  '.mjs': 'text/plain',
-  '.cjs': 'text/plain',
-  '.css': 'text/plain',
-  '.scss': 'text/plain',
-  '.less': 'text/plain',
-  '.py': 'text/plain',
-  '.go': 'text/plain',
-  '.java': 'text/plain',
-  '.kt': 'text/plain',
-  '.rs': 'text/plain',
-  '.rb': 'text/plain',
-  '.php': 'text/plain',
-  '.sh': 'text/plain',
-  '.bash': 'text/plain',
-  '.zsh': 'text/plain',
-  '.sql': 'text/plain',
-  '.toml': 'text/plain',
 };
 
 export function riffAttachmentMediaType(
@@ -890,7 +863,6 @@ export function riffAttachmentMediaType(
   if (declared && RIFF_IMAGE_MEDIA_TYPES.has(declared)) return declared;
 
   const lowerName = name.replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
-  if (lowerName === 'dockerfile' || lowerName === 'makefile') return 'text/plain';
   const dot = lowerName.lastIndexOf('.');
   if (dot >= 0) {
     const textType = RIFF_TEXT_MEDIA_TYPE_BY_EXTENSION[lowerName.slice(dot)];

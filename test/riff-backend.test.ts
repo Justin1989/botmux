@@ -984,8 +984,15 @@ describe('RiffBackend', () => {
       const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
       expect(riffAttachmentMediaType('wrong.jpg', 'image/jpeg', png)).toBe('image/png');
       expect(riffAttachmentMediaType('photo.bin', 'image/webp')).toBe('image/webp');
-      expect(riffAttachmentMediaType('main.ts')).toBe('text/plain');
       expect(riffAttachmentMediaType('README.md')).toBe('text/markdown');
+      expect(riffAttachmentMediaType('payload.json')).toBe('application/json');
+      expect(riffAttachmentMediaType('notes.txt')).toBe('text/plain');
+      expect(riffAttachmentMediaType('service.log')).toBe('text/plain');
+      expect(riffAttachmentMediaType('rows.csv')).toBe('text/csv');
+      expect(riffAttachmentMediaType('config.yaml')).toBe('text/plain');
+      expect(riffAttachmentMediaType('config.yml')).toBe('text/plain');
+      expect(riffAttachmentMediaType('main.ts')).toBe('application/octet-stream');
+      expect(riffAttachmentMediaType('README.markdown')).toBe('application/octet-stream');
       expect(riffAttachmentMediaType('payload.bin')).toBe('application/octet-stream');
     });
 
@@ -993,7 +1000,7 @@ describe('RiffBackend', () => {
       const dir = mkdtempSync(join(tmpdir(), 'botmux-riff-media-'));
       try {
         const imagePath = join(dir, 'image.bin');
-        const sourcePath = join(dir, 'main.ts');
+        const sourcePath = join(dir, 'notes.txt');
         writeFileSync(imagePath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
         writeFileSync(sourcePath, 'export const answer = 42;\n');
 

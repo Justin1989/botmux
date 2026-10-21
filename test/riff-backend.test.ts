@@ -6,12 +6,21 @@
  * Run:  pnpm vitest run test/riff-backend.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { RiffBackend, parseRiffRepoName, deriveRiffRepoFromWorkingDir, deriveRiffReposFromDirs } from '../src/adapters/backend/riff-backend.js';
+import {
+  RiffBackend,
+  parseRiffRepoName,
+  deriveRiffRepoFromWorkingDir,
+  deriveRiffReposFromDirs,
+  riffAttachmentMediaType,
+} from '../src/adapters/backend/riff-backend.js';
 
 const BASE = 'https://riff-boe.example.com';
 
@@ -967,6 +976,50 @@ describe('RiffBackend', () => {
       const firstJwt = order.indexOf('getJwt');
       expect(firstRead).toBeGreaterThanOrEqual(0);
       expect(firstJwt).toBeGreaterThan(firstRead);
+    });
+  });
+
+  describe('attachment media types', () => {
+    it('uses image magic first and maps Riff-supported text filenames', () => {
+      const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+      expect(riffAttachmentMediaType('wrong.jpg', 'image/jpeg', png)).toBe('image/png');
+      expect(riffAttachmentMediaType('photo.bin', 'image/webp')).toBe('image/webp');
+      expect(riffAttachmentMediaType('main.ts')).toBe('text/plain');
+      expect(riffAttachmentMediaType('README.md')).toBe('text/markdown');
+      expect(riffAttachmentMediaType('payload.bin')).toBe('application/octet-stream');
+    });
+
+    it('sets each multipart attachment Blob type instead of sending an empty media type', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-riff-media-'));
+      try {
+        const imagePath = join(dir, 'image.bin');
+        const sourcePath = join(dir, 'main.ts');
+        writeFileSync(imagePath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+        writeFileSync(sourcePath, 'export const answer = 42;\n');
+
+        const be = makeBackend({ injectStatusLines: false });
+        be.write([
+          'inspect these',
+          '<attachments>',
+          `<image path="${imagePath}" mime_type="image/jpeg" />`,
+          `<file path="${sourcePath}" />`,
+          '</attachments>',
+        ].join('\n'));
+        for (let i = 0; i < 50 && !calls.some(c => c.url.includes('/api/task-execute')); i++) await flush();
+
+        const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+        expect(exec).toBeTruthy();
+        const form = exec.init?.body as FormData;
+        const uploaded = form.getAll('attachments') as Blob[];
+        // Bun appends charset=utf-8 to text Blobs; Node preserves text/plain.
+        // Compare the standards-level media type base across both runtimes.
+        expect(uploaded.map(file => file.type.split(';', 1)[0])).toEqual(['image/png', 'text/plain']);
+
+        resolvers.shift()!(taskResponse('task-media'));
+        await flush();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 

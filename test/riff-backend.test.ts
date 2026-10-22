@@ -8,7 +8,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -1021,7 +1021,7 @@ describe('RiffBackend', () => {
         const wire = Buffer.from(await wireRequest.arrayBuffer()).toString('latin1');
         expect(wire).toContain('filename="image.bin"\r\nContent-Type: image/png');
         for (const path of textPaths) {
-          expect(wire).toContain(`filename="${path.split('/').pop()}"\r\nContent-Type: application/octet-stream`);
+          expect(wire).toContain(`filename="${basename(path)}"\r\nContent-Type: application/octet-stream`);
         }
         expect(wire.toLowerCase()).not.toContain('charset=');
 

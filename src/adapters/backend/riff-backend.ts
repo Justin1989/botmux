@@ -838,40 +838,16 @@ const RIFF_IMAGE_MEDIA_TYPES = new Set([
   'image/gif',
 ]);
 
-/** Riff's text attachment validator requires both a text media type and one of
- * these exact filename suffixes. Keep this allowlist narrower than generic
- * source-code detection so an accepted media type cannot bypass the suffix gate. */
-const RIFF_TEXT_MEDIA_TYPE_BY_EXTENSION: Record<string, string> = {
-  '.md': 'text/markdown',
-  '.json': 'application/json',
-  '.csv': 'text/csv',
-  '.txt': 'text/plain',
-  '.log': 'text/plain',
-  '.yaml': 'text/plain',
-  '.yml': 'text/plain',
-};
-
-export function riffAttachmentMediaType(
-  name: string,
+export function riffAttachmentImageMediaType(
   declaredMimeType?: string,
   bytes?: Buffer,
-): string {
+): string | undefined {
   const detectedImage = bytes ? detectImageFormat(bytes)?.mimeType : undefined;
   if (detectedImage) return detectedImage;
 
   const declared = declaredMimeType?.split(';', 1)[0]?.trim().toLowerCase();
   if (declared && RIFF_IMAGE_MEDIA_TYPES.has(declared)) return declared;
-
-  const lowerName = name.replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
-  const dot = lowerName.lastIndexOf('.');
-  if (dot >= 0) {
-    const textType = RIFF_TEXT_MEDIA_TYPE_BY_EXTENSION[lowerName.slice(dot)];
-    if (textType) return textType;
-  }
-
-  // Keep the former server-side rejection for unsupported binaries, but make
-  // the multipart part explicit instead of emitting a Blob with an empty type.
-  return 'application/octet-stream';
+  return undefined;
 }
 
 /**
@@ -2130,7 +2106,7 @@ export class RiffBackend implements SessionBackend {
       form.append('payload', JSON.stringify(payload));
       for (const att of attachments) {
         try {
-          const fileData = await this.readFileAsBlob(att.path, att.name, att.mimeType);
+          const fileData = await this.readFileAsBlob(att.path, att.mimeType);
           form.append('attachments', fileData, att.name);
         } catch (err) {
           logger.warn(`[riff] failed to read attachment ${att.path}: ${err}`);
@@ -2198,11 +2174,14 @@ export class RiffBackend implements SessionBackend {
     return result.data.id;
   }
 
-  private async readFileAsBlob(path: string, name = this.basename(path), declaredMimeType?: string): Promise<Blob> {
+  private async readFileAsBlob(path: string, declaredMimeType?: string): Promise<Blob> {
     const { readFile } = await import('node:fs/promises');
     const buf = await readFile(path);
-    const mediaType = riffAttachmentMediaType(name, declaredMimeType, buf);
-    return new Blob([buf], { type: mediaType });
+    const mediaType = riffAttachmentImageMediaType(declaredMimeType, buf);
+    // Keep text/other files untyped. Bun adds charset parameters to several
+    // explicit text Blob types, while Riff expects multipart octet-stream and
+    // applies its own trusted-extension allowlist for textual attachments.
+    return mediaType ? new Blob([buf], { type: mediaType }) : new Blob([buf]);
   }
 
   /**

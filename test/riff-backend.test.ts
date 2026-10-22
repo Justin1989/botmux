@@ -19,7 +19,7 @@ import {
   parseRiffRepoName,
   deriveRiffRepoFromWorkingDir,
   deriveRiffReposFromDirs,
-  riffAttachmentMediaType,
+  riffAttachmentImageMediaType,
 } from '../src/adapters/backend/riff-backend.js';
 
 const BASE = 'https://riff-boe.example.com';
@@ -980,36 +980,33 @@ describe('RiffBackend', () => {
   });
 
   describe('attachment media types', () => {
-    it('uses image magic first and maps Riff-supported text filenames', () => {
+    it('types only supported images and leaves text media types to Riff extension validation', () => {
       const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-      expect(riffAttachmentMediaType('wrong.jpg', 'image/jpeg', png)).toBe('image/png');
-      expect(riffAttachmentMediaType('photo.bin', 'image/webp')).toBe('image/webp');
-      expect(riffAttachmentMediaType('README.md')).toBe('text/markdown');
-      expect(riffAttachmentMediaType('payload.json')).toBe('application/json');
-      expect(riffAttachmentMediaType('notes.txt')).toBe('text/plain');
-      expect(riffAttachmentMediaType('service.log')).toBe('text/plain');
-      expect(riffAttachmentMediaType('rows.csv')).toBe('text/csv');
-      expect(riffAttachmentMediaType('config.yaml')).toBe('text/plain');
-      expect(riffAttachmentMediaType('config.yml')).toBe('text/plain');
-      expect(riffAttachmentMediaType('main.ts')).toBe('application/octet-stream');
-      expect(riffAttachmentMediaType('README.markdown')).toBe('application/octet-stream');
-      expect(riffAttachmentMediaType('payload.bin')).toBe('application/octet-stream');
+      expect(riffAttachmentImageMediaType('image/jpeg', png)).toBe('image/png');
+      expect(riffAttachmentImageMediaType('image/webp')).toBe('image/webp');
+      expect(riffAttachmentImageMediaType('text/plain')).toBeUndefined();
+      expect(riffAttachmentImageMediaType('application/json')).toBeUndefined();
+      expect(riffAttachmentImageMediaType()).toBeUndefined();
     });
 
-    it('sets each multipart attachment Blob type instead of sending an empty media type', async () => {
+    it('writes image MIME but keeps every text suffix as octet-stream on the multipart wire', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'botmux-riff-media-'));
       try {
         const imagePath = join(dir, 'image.bin');
-        const sourcePath = join(dir, 'notes.txt');
         writeFileSync(imagePath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
-        writeFileSync(sourcePath, 'export const answer = 42;\n');
+        const textPaths = ['data.json', 'notes.txt', 'service.log', 'README.md', 'rows.csv', 'config.yaml', 'config.yml']
+          .map(name => {
+            const path = join(dir, name);
+            writeFileSync(path, 'text attachment\n');
+            return path;
+          });
 
         const be = makeBackend({ injectStatusLines: false });
         be.write([
           'inspect these',
           '<attachments>',
           `<image path="${imagePath}" mime_type="image/jpeg" />`,
-          `<file path="${sourcePath}" />`,
+          ...textPaths.map(path => `<file path="${path}" />`),
           '</attachments>',
         ].join('\n'));
         for (let i = 0; i < 50 && !calls.some(c => c.url.includes('/api/task-execute')); i++) await flush();
@@ -1018,9 +1015,15 @@ describe('RiffBackend', () => {
         expect(exec).toBeTruthy();
         const form = exec.init?.body as FormData;
         const uploaded = form.getAll('attachments') as Blob[];
-        // Bun appends charset=utf-8 to text Blobs; Node preserves text/plain.
-        // Compare the standards-level media type base across both runtimes.
-        expect(uploaded.map(file => file.type.split(';', 1)[0])).toEqual(['image/png', 'text/plain']);
+        expect(uploaded.map(file => file.type)).toEqual(['image/png', '', '', '', '', '', '', '']);
+
+        const wireRequest = new Request('http://riff.test/upload', { method: 'POST', body: form });
+        const wire = Buffer.from(await wireRequest.arrayBuffer()).toString('latin1');
+        expect(wire).toContain('filename="image.bin"\r\nContent-Type: image/png');
+        for (const path of textPaths) {
+          expect(wire).toContain(`filename="${path.split('/').pop()}"\r\nContent-Type: application/octet-stream`);
+        }
+        expect(wire.toLowerCase()).not.toContain('charset=');
 
         resolvers.shift()!(taskResponse('task-media'));
         await flush();

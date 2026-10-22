@@ -14,12 +14,15 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import type { ProjectScanOptions } from './services/project-scanner.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
+import { normalizeLinkRefConfig } from './services/link-ref-config.js';
+import type { LinkRefConfig } from './services/link-ref-types.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -194,6 +197,8 @@ export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
 
 export interface GlobalConfig {
   lang?: Locale;
+  /** Machine-wide LinkRef rollout setting. Missing keeps legacy behavior. */
+  linkRefs?: LinkRefConfig;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
    *  Other creation paths intentionally ignore it. Missing means disabled. */
   groupNamePrefix?: string;
@@ -779,6 +784,11 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
 }
 
 export function globalConfigPath(): string {
+  const configured = process.env.BOTMUX_GLOBAL_CONFIG_FILE?.trim();
+  if (configured) {
+    if (!isAbsolute(configured)) throw new Error('BOTMUX_GLOBAL_CONFIG_FILE must be absolute');
+    return configured;
+  }
   return join(homedir(), '.botmux', 'config.json');
 }
 
@@ -826,6 +836,8 @@ export function readGlobalConfig(): GlobalConfig {
   const raw = readRawConfig();
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
+  const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
+  if (linkRefs) out.linkRefs = linkRefs;
   const groupNamePrefix = normalizeGroupNamePrefix(raw.groupNamePrefix);
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
@@ -1045,6 +1057,7 @@ export function repoPickerScanOptions(): ProjectScanOptions {
  *  the file (and parent dir) on first write. Use `null` to explicitly delete
  *  a known key from the file. */
 export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>): void {
+  assertDurableConfigMutationAllowed('global');
   const path = globalConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

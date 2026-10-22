@@ -11,8 +11,8 @@ import type {
   SpawnOpts,
 } from './types.js';
 import { logger } from '../../utils/logger.js';
-import { detectImageFormat } from '../../core/attachment-image-format.js';
 import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
+import { detectImageFormat } from '../../core/attachment-image-format.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -828,26 +828,6 @@ interface RiffAttachment {
   path: string;
   name: string;
   type: 'image' | 'file';
-  mimeType?: string;
-}
-
-const RIFF_IMAGE_MEDIA_TYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/webp',
-  'image/gif',
-]);
-
-export function riffAttachmentImageMediaType(
-  declaredMimeType?: string,
-  bytes?: Buffer,
-): string | undefined {
-  const detectedImage = bytes ? detectImageFormat(bytes)?.mimeType : undefined;
-  if (detectedImage) return detectedImage;
-
-  const declared = declaredMimeType?.split(';', 1)[0]?.trim().toLowerCase();
-  if (declared && RIFF_IMAGE_MEDIA_TYPES.has(declared)) return declared;
-  return undefined;
 }
 
 /**
@@ -1712,20 +1692,10 @@ export class RiffBackend implements SessionBackend {
       const fileRegex = /<file\s+[^>]*path="([^"]+)"(?:\s+name="([^"]*)")?[^>]*\/>/g;
       let m: RegExpExecArray | null;
       while ((m = imgRegex.exec(block)) !== null) {
-        attachments.push({
-          path: m[1]!,
-          name: this.basename(m[1]!),
-          type: 'image',
-          mimeType: this.extractAttribute(m[0], 'mime_type'),
-        });
+        attachments.push({ path: m[1]!, name: this.basename(m[1]!), type: 'image' });
       }
       while ((m = fileRegex.exec(block)) !== null) {
-        attachments.push({
-          path: m[1]!,
-          name: m[2] ?? this.basename(m[1]!),
-          type: 'file',
-          mimeType: this.extractAttribute(m[0], 'mime_type'),
-        });
+        attachments.push({ path: m[1]!, name: m[2] ?? this.basename(m[1]!), type: 'file' });
       }
       text = text.replace(match[0]!, '').trim();
     }
@@ -1736,11 +1706,6 @@ export class RiffBackend implements SessionBackend {
   private basename(p: string): string {
     const parts = p.split(/[/\\]/);
     return parts[parts.length - 1] ?? p;
-  }
-
-  private extractAttribute(tag: string, name: string): string | undefined {
-    const match = new RegExp(`\\s${name}="([^"]*)"`).exec(tag);
-    return match?.[1] || undefined;
   }
 
   private async createTask(prompt: string, attachments: RiffAttachment[]): Promise<void> {
@@ -2106,7 +2071,7 @@ export class RiffBackend implements SessionBackend {
       form.append('payload', JSON.stringify(payload));
       for (const att of attachments) {
         try {
-          const fileData = await this.readFileAsBlob(att.path, att.mimeType);
+          const fileData = await this.readFileAsBlob(att.path);
           form.append('attachments', fileData, att.name);
         } catch (err) {
           logger.warn(`[riff] failed to read attachment ${att.path}: ${err}`);
@@ -2174,14 +2139,13 @@ export class RiffBackend implements SessionBackend {
     return result.data.id;
   }
 
-  private async readFileAsBlob(path: string, declaredMimeType?: string): Promise<Blob> {
+  private async readFileAsBlob(path: string): Promise<Blob> {
     const { readFile } = await import('node:fs/promises');
     const buf = await readFile(path);
-    const mediaType = riffAttachmentImageMediaType(declaredMimeType, buf);
-    // Keep text/other files untyped. Bun adds charset parameters to several
-    // explicit text Blob types, while Riff expects multipart octet-stream and
-    // applies its own trusted-extension allowlist for textual attachments.
-    return mediaType ? new Blob([buf], { type: mediaType }) : new Blob([buf]);
+    // Riff validates the multipart media type; synthetic filenames may have
+    // missing or incorrect extensions, so identify images from their bytes.
+    const type = detectImageFormat(buf)?.mimeType ?? 'application/octet-stream';
+    return new Blob([buf], { type });
   }
 
   /**

@@ -35,6 +35,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { makeNativeEmbedPlugin } from './bun-native-embed-plugin.mjs';
+import { warnIfBunVersionDrifts } from './check-bun-version.mjs';
 
 const require = createRequire(import.meta.url);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -316,6 +317,8 @@ async function buildOne({ target, out }) {
   mkdirSync(dirname(outfile), { recursive: true });
 
   const baked = versionToBake();
+  const runtimeBuildId = readFileSync(join(REPO_ROOT, 'dist', '.runtime-build-id'), 'utf8').trim();
+  if (!/^[a-f0-9]{64}$/.test(runtimeBuildId)) throw new Error('Invalid runtime build id; run bun run build first');
   const result = await Bun.build({
     entrypoints: [entry],
     compile: { outfile, ...(target ? { target } : {}) },
@@ -325,7 +328,8 @@ async function buildOne({ target, out }) {
     // `bakedBinaryVersion()` (src/utils/install-info.ts), which is written so the
     // identifier is absent under Node — where the disk read still works — and only
     // this compiled path needs the constant.
-    define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked) },
+    define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked),
+      '__BOTMUX_RUNTIME_BUILD_ID__': JSON.stringify(runtimeBuildId) },
     plugins: [makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode })],
   });
   if (!result.success) {
@@ -342,6 +346,8 @@ async function main() {
     console.error('This script must be run with Bun: `bun scripts/build-bun-binary.mjs ...`');
     process.exit(1);
   }
+  // 编译产物随 bun 版本走，是最该与 CI 对齐的一步（只告警，不拦截）。
+  warnIfBunVersionDrifts();
   const args = parseArgs(process.argv.slice(2));
   if (args.all) {
     for (const target of RELEASE_TARGETS) await buildOne({ target, out: undefined });
